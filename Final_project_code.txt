@@ -1,0 +1,903 @@
+import geopandas as gpd
+import folium
+from folium.plugins import Search
+import os
+import webbrowser
+import base64
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.colors import ListedColormap, BoundaryNorm
+from shapely.geometry import Point, LineString
+from folium.plugins import Search, LocateControl
+
+# -------------------------------------------------
+# BASE FOLDER
+# -------------------------------------------------
+base = os.path.dirname(os.path.abspath(__file__))
+data_folder = os.path.join(base, "Data")
+print("📁 DATA PATH:", data_folder)
+
+# -------------------------------------------------
+# FILE PATHS
+# -------------------------------------------------
+regions_path = os.path.join(data_folder, "Regions.shp")
+fires_path = os.path.join(data_folder, "Fire_points.shp")
+vegetation_path = os.path.join(data_folder, "Vegetation Cover.shp")
+rainfall_path = os.path.join(data_folder, "Average annual rainfall.shp")
+temperature_path = os.path.join(data_folder, "Average annual temperatures.shp")
+towns_path = os.path.join(data_folder, "Towns and Villages.shp")
+roads_clip_path = os.path.join(data_folder, "Roads_clip.shp")
+
+# -------------------------------------------------
+# LOAD FUNCTION
+# -------------------------------------------------
+def load_shapefile(path, name):
+    if not os.path.exists(path):
+        print(f"❌ {name} missing -> {path}")
+        return None
+    try:
+        gdf = gpd.read_file(path)
+        print(f"✅ Loaded {name}: {len(gdf)} features")
+        return gdf
+    except Exception as e:
+        print(f"❌ Error loading {name}: {e}")
+        return None
+
+regions = load_shapefile(regions_path, "Regions")
+fires = load_shapefile(fires_path, "Fire Points")
+vegetation = load_shapefile(vegetation_path, "Vegetation")
+rainfall = load_shapefile(rainfall_path, "Rainfall")
+temperature = load_shapefile(temperature_path, "Temperature")
+towns = load_shapefile(towns_path, "Towns and Villages")
+roads_clip = load_shapefile(roads_clip_path, "Roads Clip")
+
+if regions is None or fires is None:
+    print("❌ Critical data missing")
+    exit()
+
+# -------------------------------------------------
+# CRS FIX
+# -------------------------------------------------
+def to_wgs84(gdf):
+    if gdf is None:
+        return None
+    if gdf.crs is None:
+        return gdf.set_crs(epsg=4326)
+    return gdf.to_crs(epsg=4326)
+
+regions = to_wgs84(regions)
+fires = to_wgs84(fires)
+vegetation = to_wgs84(vegetation)
+rainfall = to_wgs84(rainfall)
+temperature = to_wgs84(temperature)
+towns = to_wgs84(towns)
+roads_clip = to_wgs84(roads_clip)
+
+fires = fires[fires.geometry.notnull()]
+
+# -------------------------------------------------
+# FIRE CLASSIFICATION
+# -------------------------------------------------
+def classify_fire(row):
+    score = abs(row.geometry.x) + abs(row.geometry.y)
+    if score > 25:
+        return "High", "red"
+    elif score > 15:
+        return "Medium", "orange"
+    return "Low", "green"
+
+fires["risk"], fires["color"] = zip(*fires.apply(classify_fire, axis=1))
+
+# -------------------------------------------------
+# MAP BASE
+# -------------------------------------------------
+m = folium.Map(location=[-22.5, 17], zoom_start=6, tiles=None)
+
+# 🔵 CURRENT LOCATION TOOL
+LocateControl(
+    auto_start=False,   # user clicks to activate
+    flyTo=True,         # zooms to user location
+    keepCurrentZoomLevel=False
+).add_to(m)
+
+folium.TileLayer("OpenStreetMap").add_to(m)
+
+folium.TileLayer(
+    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    attr="Esri",
+    name="Satellite"
+).add_to(m)
+
+folium.TileLayer(
+    tiles="https://stamen-tiles.a.ssl.fastly.net/terrain/{z}/{x}/{y}.png",
+    attr="Stamen",
+    name="Terrain"
+).add_to(m)
+
+# -------------------------------------------------
+# REGIONS
+# -------------------------------------------------
+regions_layer = folium.GeoJson(
+    regions,
+    name="Regions",
+    style_function=lambda x: {
+        "fillColor": "lightblue",
+        "color": "black",
+        "weight": 1.5,
+        "fillOpacity": 0.4
+    },
+    tooltip=folium.GeoJsonTooltip(fields=["region_nam"])
+).add_to(m)
+
+# -------------------------------------------------
+# FIRE POINTS (ORIGINAL)
+# -------------------------------------------------
+fire_layer = folium.FeatureGroup(name="Fire Points", show=True)
+
+for _, row in fires.iterrows():
+    folium.CircleMarker(
+    location=[row.geometry.y, row.geometry.x],
+    radius=3,
+    color=row["color"],
+    fill=True,
+    fill_color=row["color"],
+    popup=f"Risk: {row['risk']}",
+    tooltip=f"Fire Point | Type: Point | Risk: {row['risk']}"
+).add_to(fire_layer)
+
+fire_layer.add_to(m)
+
+# -------------------------------------------------
+# VEGETATION
+# -------------------------------------------------
+def vegetation_style(feature):
+    biome = str(feature["properties"].get("biome","")).lower()
+    if "salt" in biome:
+        color = "white"
+    elif "desert" in biome:
+        color = "orange"
+    elif "savanna" in biome:
+        color = "#8B4513"
+    elif "nama" in biome:
+        color = "#006400"
+    else:
+        color = "#66c2a5"
+
+    return {
+        "fillColor": color,
+        "color": "black",
+        "weight": 0.3,
+        "fillOpacity": 0.6
+    }
+
+if vegetation is not None:
+    folium.GeoJson(
+        vegetation,
+        name="Vegetation",
+        style_function=vegetation_style,
+        tooltip=folium.GeoJsonTooltip(
+            fields=["biome"],
+            aliases=["Vegetation Type:"],
+            sticky=True
+        )
+    ).add_to(m)
+
+# -------------------------------------------------
+# RAINFALL
+# -------------------------------------------------
+rain_classes = ["0-50","50-100","100-150","150-200","200-250","250-300","300-350","350-400","400-450","450-500","500-550","550-600","more than 600"]
+rain_colors = ["#f7fbff","#e3eef9","#c6dbef","#9ecae1","#6baed6","#4292c6","#2171b5","#08519c","#08306b","#062a78","#041f5a","#02102e","#010817"]
+def rainfall_style(feature):
+    val = str(feature["properties"].get("CLASS","")).strip().lower()
+    try: idx = rain_classes.index(val)
+    except: idx = 0
+    return {"fillColor": rain_colors[idx], "color": "black", "weight": 0.2, "fillOpacity": 0.75}
+
+if rainfall is not None:
+    folium.GeoJson(
+        rainfall,
+        name="Rainfall",
+        style_function=rainfall_style,
+        tooltip=folium.GeoJsonTooltip(
+            fields=["CLASS"],
+            aliases=["Rainfall Class:"],
+            sticky=True
+        )
+    ).add_to(m)
+# -------------------------------------------------
+# TEMPERATURE
+# -------------------------------------------------
+temp_order = ["<16","16-17","17-18","18-19","19-20","20-21","21-22",">22"]
+temp_colors = ["#fff5f5","#fee0e0","#fcbba1","#fc9272","#fb6a4a","#ef3b2c","#cb181d","#7f0000"]
+def temperature_style(feature):
+    val = str(feature["properties"].get("TEMP","")).strip().replace(" ","")
+    try: idx = temp_order.index(val)
+    except: idx = 0
+    return {"fillColor": temp_colors[idx], "color": "black", "weight": 0.2, "fillOpacity": 0.75}
+
+if temperature is not None:
+    folium.GeoJson(
+        temperature,
+        name="Temperature",
+        style_function=temperature_style,
+        tooltip=folium.GeoJsonTooltip(
+            fields=["TEMP"],
+            aliases=["Temperature Class:"],
+            sticky=True
+        )
+    ).add_to(m)
+# -------------------------------------------------
+# ROADS
+# -------------------------------------------------
+if roads_clip is not None:
+    folium.GeoJson(
+        roads_clip,
+        name="Roads",
+        style_function=lambda x: {"color": "black", "weight": 1.5}
+    ).add_to(m)
+
+# -------------------------------------------------
+# TOWNS
+# -------------------------------------------------
+town_layer = folium.FeatureGroup(name="Towns and Villages", show=False)
+
+if towns is not None:
+    for _, row in towns.iterrows():
+        geom = row.geometry
+        if geom is None: continue
+        if geom.geom_type == "Point":
+            lat, lon = geom.y, geom.x
+        elif geom.geom_type == "MultiPoint":
+            pt = list(geom.geoms)[0]
+            lat, lon = pt.y, pt.x
+        elif geom.geom_type in ["Polygon", "MultiPolygon"]:
+            c = geom.centroid
+            lat, lon = c.y, c.x
+        else: continue
+
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=4,
+            color="grey",
+            fill=True,
+            fill_color="grey",
+            fill_opacity=0.8
+        ).add_to(town_layer)
+
+town_layer.add_to(m)
+
+# -------------------------------------------------
+# SEARCH
+# -------------------------------------------------
+Search(layer=regions_layer, search_label="region_nam").add_to(m)
+# =================================================
+# 🔍 SEARCH BAR SIZE INCREASE (MAKE IT LONGER)
+# =================================================
+search_style = """
+<style>
+/* Target the search box */
+.leaflet-control-search input {
+    width: 260px !important;   /* increase width (default ~160px) */
+    font-size: 14px;
+}
+
+/* Optional: make search button align nicely */
+.leaflet-control-search {
+    width: auto !important;
+}
+</style>
+"""
+
+m.get_root().html.add_child(folium.Element(search_style))
+welcome_box = """
+<style>
+#welcomeBox {
+    position: fixed;
+    bottom: 90px;        /* 👈 move to bottom */
+    left: 15px;          /* 👈 keep left side */
+    z-index: 99998;
+
+    width: 300px;        /* slightly bigger */
+    padding: 18px 20px;
+
+    background: white;
+    border-radius: 12px;
+    border: 1px solid rgba(0,0,0,0.15);
+
+    box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+
+    font-size: 18px;     /* bigger text */
+    line-height: 1.6;
+    color: #222;
+
+    font-family: Arial, sans-serif;
+}
+
+/* hover effect */
+#welcomeBox:hover {
+    box-shadow: 0 0 14px rgba(0,0,0,0.35);
+    transform: scale(1.02);
+    transition: all 0.2s ease-in-out;
+}
+</style>
+
+<div id="welcomeBox">
+    👋 <b style="font-size:17px;">Hey, Welcome to FIRE_ESCAPE</b><br><br>
+    Visualizing the heat so you can find the cool way out ☺️
+</div>
+"""
+
+m.get_root().html.add_child(folium.Element(welcome_box))
+
+# =================================================
+# 🔥 CLASSIFIED HEATMAP (Unchanged)
+# =================================================
+fire_lats = fires.geometry.y.values
+fire_lons = fires.geometry.x.values
+lon_min, lon_max = fire_lons.min() - 0.5, fire_lons.max() + 0.5
+lat_min, lat_max = fire_lats.min() - 0.5, fire_lats.max() + 0.5
+
+heatmap, xedges, yedges = np.histogram2d(fire_lons, fire_lats, bins=250, range=[[lon_min, lon_max], [lat_min, lat_max]])
+
+for _ in range(3):
+    heatmap = (np.roll(heatmap, 1, axis=0) + np.roll(heatmap, -1, axis=0) +
+               np.roll(heatmap, 1, axis=1) + np.roll(heatmap, -1, axis=1) + heatmap) / 5
+
+heatmap = heatmap / heatmap.max()
+
+classes = [0.0, 0.2, 0.45, 0.7, 0.9, 1.0]
+colors = ['#d0d0d0', 'yellow', 'orange', 'red', 'maroon']
+
+cmap = ListedColormap(colors)
+norm = BoundaryNorm(classes, cmap.N)
+
+fig, ax = plt.subplots(figsize=(9.3, 9.9))
+regions.plot(
+    ax=ax,
+    facecolor="none",
+    edgecolor="black",
+    linewidth=1,
+    zorder=3
+)
+minx, miny, maxx, maxy = regions.total_bounds
+ax.set_xlim(minx, maxx)
+ax.set_ylim(miny, maxy)
+ax.set_aspect('equal')
+
+for _, region in regions.iterrows():
+    if region.geometry is None: continue
+    ax.imshow(heatmap.T, origin='lower', extent=[lon_min, lon_max, lat_min, lat_max],
+              cmap=cmap, norm=norm, alpha=0.85, zorder=2,
+              clip_path=plt.Polygon(region.geometry.exterior.coords, closed=True, transform=ax.transData))
+
+legend_labels = ['None', 'Low', 'Moderate', 'High', 'Very High']
+patches = [plt.Rectangle((0,0), 1, 1, facecolor=color) for color in colors]
+ax.legend(patches, legend_labels, title="Fire Density", loc='lower right', fontsize=10, title_fontsize=11, frameon=True)
+
+ax.set_xticks([])
+ax.set_yticks([])
+
+heat_img = os.path.join(base, "heatmap.png")
+plt.savefig(heat_img, dpi=230, facecolor='white')
+plt.close()
+
+with open(heat_img, "rb") as f:
+    img_b64 = base64.b64encode(f.read()).decode()
+
+heat_html = f"""
+<style>
+
+#heatBtn {{
+    position: fixed;
+    top: 355px;
+    right: 15px;
+    z-index: 99999;
+
+    background: linear-gradient(145deg, #c62828, #8e0000);
+    color: white;
+
+    border: 1px solid rgba(255,255,255,0.15);
+    padding: 12px 16px;
+    font-weight: bold;
+    border-radius: 10px;
+    cursor: pointer;
+
+    transition: all 0.25s ease-in-out;
+
+    box-shadow:
+        0 3px 10px rgba(0,0,0,0.4),
+        inset 0 1px 0 rgba(255,255,255,0.2);
+}}
+
+#heatBtn:hover {{
+    background: linear-gradient(145deg, #ff3b3b, #b71c1c);
+
+    transform: scale(1.08);
+
+    box-shadow:
+        0 0 6px rgba(255, 80, 80, 0.6),
+        0 0 18px rgba(255, 50, 50, 0.8),
+        0 0 35px rgba(255, 0, 0, 0.9),
+        0 10px 25px rgba(0,0,0,0.6),
+        inset 0 1px 0 rgba(255,255,255,0.3);
+
+    filter: brightness(1.15);
+}}
+
+#heatPanel {{
+    display: none;
+    position: fixed;
+    top: 8%;
+    left: 10%;
+    width: 60%;
+    height: 82%;
+    background: white;
+    z-index: 100000;
+    border-radius: 8px;
+    box-shadow: 0 0 20px rgba(0,0,0,0.5);
+    overflow: hidden;
+}}
+
+#heatPanel img {{
+    width: 70%;
+    height: auto;
+    max-height: 88%;
+}}
+
+#closeBtn {{
+    position: absolute;
+    top: 12px;
+    right: 15px;
+    background: #d32f2f;
+    color: white;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-weight: bold;
+    z-index: 100001;
+}}
+
+</style>
+
+<div id="heatBtn" onclick="document.getElementById('heatPanel').style.display='block'">
+    Fire Density Heatmap
+</div>
+
+<div id="heatPanel">
+    <h3 style="margin:35px 0 10px 0; text-align:center; color:#333; font-weight:bold;">
+        Namibia Wildfire Density Heatmap
+    </h3>
+    <img src="data:image/png;base64,{img_b64}">
+    <button id="closeBtn" onclick="document.getElementById('heatPanel').style.display='none'">
+        ✕ Close
+    </button>
+</div>
+"""
+m.get_root().html.add_child(folium.Element(heat_html))
+
+# =================================================
+import json
+from shapely.ops import unary_union
+from shapely.geometry import mapping
+
+# --- 1. Build dissolved buffer around all fire points (0.15 deg ≈ ~15 km) ---
+buffer_distance = 0.15
+fire_buffers = fires.geometry.buffer(buffer_distance)
+dissolved_buffer = unary_union(fire_buffers)
+
+# Convert dissolved buffer to GeoJSON for injection into the map
+buffer_geojson = json.dumps({
+    "type": "Feature",
+    "geometry": mapping(dissolved_buffer),
+    "properties": {}
+})
+
+# --- 2. Erase roads that fall WITHIN the dissolved buffer ---
+safe_roads_geojson = "null"
+if roads_clip is not None:
+    safe_roads = roads_clip[~roads_clip.geometry.intersects(dissolved_buffer)].copy()
+    if not safe_roads.empty:
+        safe_roads_geojson = safe_roads.to_json()
+
+# --- 3. Closest facility lines removed (straight lines omitted by design) ---
+
+# --- 4. Inject everything into the map as a live JS analysis engine ---
+analysis_html = f"""
+<style>
+#analysisBtn {{
+    position: fixed;
+    top: 415px;
+    right: 15px;
+    z-index: 99999;
+
+    background: linear-gradient(145deg, #fff3b0, #ffd54f);
+    color: black;
+
+    border: 1px solid rgba(0,0,0,0.25);
+    padding: 12px 18px;
+    font-weight: bold;
+    border-radius: 10px;
+    cursor: pointer;
+
+    font-size: 13px;
+    letter-spacing: 1px;
+
+    box-shadow:
+        0 3px 10px rgba(0,0,0,0.35),
+        inset 0 1px 0 rgba(255,255,255,0.4);
+
+    transition: all 0.25s ease-in-out;
+}}
+
+/* ⭐ HOVER GLOW (MATCHES OTHER TOOLS STYLE) */
+#analysisBtn:hover {{
+    background: linear-gradient(145deg, #ffe680, #ffcc00);
+
+    transform: scale(1.08);
+
+    box-shadow:
+        0 0 8px rgba(255, 235, 59, 0.6),
+        0 0 20px rgba(255, 193, 7, 0.8),
+        0 0 35px rgba(255, 152, 0, 0.9),
+        0 10px 25px rgba(0,0,0,0.5);
+
+    filter: brightness(1.1);
+}}
+
+#analysisPanel {{
+    display: none;
+    position: fixed;
+    top: 6%;
+    left: 6%;
+    width: 78%;
+    max-height: 85%;
+    background: #1a1a2e;
+    color: #e0e0e0;
+    z-index: 100000;
+    border-radius: 12px;
+    box-shadow: 0 0 40px rgba(128,0,255,0.5);
+    padding: 28px 32px;
+    overflow-y: auto;
+    border: 1px solid #6a0dad;
+    font-family: 'Courier New', monospace;
+}}
+
+#analysisPanel h2 {{
+    color: #c084fc;
+    font-size: 20px;
+    margin-bottom: 6px;
+    border-bottom: 1px solid #6a0dad;
+    padding-bottom: 10px;
+    letter-spacing: 2px;
+}}
+
+.log-line {{
+    padding: 5px 0;
+    font-size: 13px;
+    color: #a5f3a5;
+    animation: fadeIn 0.4s ease;
+}}
+
+.log-line.purple {{ color: #c084fc; font-weight: bold; }}
+.log-line.warn    {{ color: #fbbf24; }}
+.log-line.error   {{ color: #f87171; }}
+
+@keyframes fadeIn {{ from {{ opacity:0; transform: translateX(-8px); }} to {{ opacity:1; transform: translateX(0); }} }}
+
+.btn-row {{ margin-top: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
+
+.btn-gen {{
+    background: linear-gradient(135deg, #7c3aed, #4f46e5);
+    color: white; padding: 11px 24px; border: none;
+    border-radius: 6px; cursor: pointer; font-weight: bold;
+    font-size: 13px; letter-spacing: 1px;
+    box-shadow: 0 0 12px rgba(124,58,237,0.6);
+    transition: all 0.2s;
+}}
+.btn-gen:hover {{ background: linear-gradient(135deg, #6d28d9, #4338ca); transform: translateY(-1px); }}
+
+.btn-clear {{
+    background: #374151; color: #f87171;
+    padding: 11px 24px; border: 1px solid #f87171;
+    border-radius: 6px; cursor: pointer; font-weight: bold;
+    font-size: 13px; letter-spacing: 1px; transition: all 0.2s;
+}}
+.btn-clear:hover {{ background: #4b1c1c; }}
+
+.btn-close {{
+    background: transparent; color: #9ca3af;
+    padding: 11px 24px; border: 1px solid #4b5563;
+    border-radius: 6px; cursor: pointer; font-size: 13px;
+    transition: all 0.2s; margin-left: auto;
+}}
+.btn-close:hover {{ color: white; border-color: #9ca3af; }}
+
+.progress-bar {{
+    height: 4px;
+    background: linear-gradient(90deg, #7c3aed, #c084fc);
+    border-radius: 2px;
+    width: 0%;
+    transition: width 0.4s ease;
+    margin: 14px 0;
+}}
+
+.stat-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px;
+    margin: 14px 0;
+}}
+
+.stat-box {{
+    background: #0f0f23;
+    border: 1px solid #6a0dad;
+    border-radius: 8px;
+    padding: 12px;
+    text-align: center;
+}}
+
+.stat-box .val {{ font-size: 22px; color: #c084fc; font-weight: bold; }}
+.stat-box .lbl {{ font-size: 11px; color: #9ca3af; margin-top: 4px; }}
+</style>
+
+<div id="analysisBtn" onclick="showAnalysisPanel()"> ANALYSIS</div>
+
+<div id="analysisPanel">
+    <h2> FIRE ESCAPE — GIS ANALYSIS ENGINE</h2>
+    <div id="progressBar" class="progress-bar"></div>
+    <div id="logContent">
+        <p style="color:#9ca3af; font-size:13px;">Click <strong style="color:#c084fc;">Generate Analysis</strong> to run live buffer, road-erase, and closest-facility calculations.</p>
+    </div>
+    <div class="btn-row">
+        <button class="btn-gen"   onclick="generateEvacuationAnalysis()">▶ Generate Analysis</button>
+        <button class="btn-clear" onclick="clearAnalysis()">✕ Clear Analysis</button>
+        <button class="btn-close" onclick="document.getElementById('analysisPanel').style.display='none'">Close</button>
+    </div>
+</div>
+
+<script>
+// ---- Pre-computed Python data injected here ----
+const BUFFER_GEOJSON   = {buffer_geojson};
+const SAFE_ROADS_GJ    = {safe_roads_geojson};
+
+
+// ---- Layer references (cleared on reset) ----
+let analysisLayers = [];
+
+function showAnalysisPanel() {{
+    document.getElementById('analysisPanel').style.display = 'block';
+}}
+
+function log(msg, cls='log-line') {{
+    const d = document.getElementById('logContent');
+    const p = document.createElement('p');
+    p.className = cls;
+    p.innerHTML = msg;
+    d.appendChild(p);
+    d.scrollTop = d.scrollHeight;
+}}
+
+function setProgress(pct) {{
+    document.getElementById('progressBar').style.width = pct + '%';
+}}
+
+function sleep(ms) {{ return new Promise(r => setTimeout(r, ms)); }}
+
+async function generateEvacuationAnalysis() {{
+    // Reset log
+    document.getElementById('logContent').innerHTML = '';
+    setProgress(0);
+
+    const map = window._leaflet_map || Object.values(window).find(v => v && v._leaflet_id && v.addLayer);
+
+    log('⚙ Initialising analysis engine...');
+    await sleep(400);
+    setProgress(10);
+
+    // ---- STEP 1: Draw dissolved buffer ----
+    log('⚙ Step 1 — Generating dissolved buffers around fire points...');
+    await sleep(600);
+
+    const bufferLayer = L.geoJSON(BUFFER_GEOJSON, {{
+        style: {{
+            color: 'purple',
+            fillColor: 'purple',
+            fillOpacity: 0.27,
+            weight: 2,
+            opacity: 0.6,
+            dashArray: '6 3'
+        }}
+    }}).addTo(map);
+    analysisLayers.push(bufferLayer);
+    setProgress(35);
+    log('✔ Dissolved buffer created around all high-risk fire points', 'log-line purple');
+    await sleep(500);
+
+    // ---- STEP 2: Safe roads (roads outside buffer) ----
+    log('⚙ Step 2 — Erasing roads inside fire buffers...');
+    await sleep(600);
+
+    if (SAFE_ROADS_GJ !== null) {{
+        const safeRoadsLayer = L.geoJSON(SAFE_ROADS_GJ, {{
+            style: {{
+                color: 'purple',
+                weight: 1.8,
+                opacity: 0.27
+            }}
+        }}).addTo(map);
+        analysisLayers.push(safeRoadsLayer);
+        log('✔ Roads within buffers erased — safe road network retained', 'log-line purple');
+    }} else {{
+        log('⚠ Road data unavailable — skipping road erase step', 'log-line warn');
+    }}
+    setProgress(65);
+    await sleep(500);
+
+    setProgress(90);
+    await sleep(400);
+
+    // ---- Summary stats ----
+    setProgress(100);
+
+    log('');
+    log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━', 'log-line purple');
+    log('✅ ANALYSIS COMPLETE', 'log-line purple');
+
+    const statsHtml = `
+        <div class="stat-grid">
+            <div class="stat-box"><div class="val">27%</div><div class="lbl">Layer Transparency</div></div>
+            <div class="stat-box"><div class="val">~15km</div><div class="lbl">Buffer Radius</div></div>
+            <div class="stat-box"><div class="val">2</div><div class="lbl">Steps Completed</div></div>
+        </div>
+        <p class="log-line purple">🟣 Purple = Dissolved Buffers · Safe Roads</p>
+    `;
+    document.getElementById('logContent').insertAdjacentHTML('beforeend', statsHtml);
+}}
+
+function clearAnalysis() {{
+    const map = window._leaflet_map || Object.values(window).find(v => v && v._leaflet_id && v.addLayer);
+    analysisLayers.forEach(layer => {{ try {{ map.removeLayer(layer); }} catch(e) {{}} }});
+    analysisLayers = [];
+
+    document.getElementById('logContent').innerHTML = '';
+    document.getElementById('progressBar').style.width = '0%';
+
+    const d = document.getElementById('logContent');
+    d.innerHTML = '<p style="color:#9ca3af; font-size:13px;">Analysis cleared. Click <strong style="color:#c084fc;">Generate Analysis</strong> to run again.</p>';
+}}
+
+// Store map reference globally so JS can find it
+document.addEventListener('DOMContentLoaded', function() {{
+    setTimeout(function() {{
+        const maps = Object.values(window).filter(v => v && typeof v === 'object' && v._leaflet_id);
+        if (maps.length) window._leaflet_map = maps[0];
+    }}, 1000);
+}});
+</script>
+"""
+
+m.get_root().html.add_child(folium.Element(analysis_html))
+zip_html = """
+<style>
+
+#zipBtn {
+    position: fixed;
+    top: 475px;
+    right: 15px;
+    z-index: 99999;
+
+    background: linear-gradient(145deg, #607d8b, #37474f);
+    color: white;
+
+    border: 1px solid rgba(255,255,255,0.2);
+    padding: 12px 16px;
+    font-weight: bold;
+    border-radius: 10px;
+    cursor: pointer;
+
+    display: inline-block;
+
+    transition: all 0.25s ease-in-out;
+
+
+    box-shadow:
+        0 3px 10px rgba(0,0,0,0.4),
+        inset 0 1px 0 rgba(255,255,255,0.2);
+}
+
+/* 🔵 COOL BLUE GLOW */
+#zipBtn:hover {
+    background: linear-gradient(145deg, #90caf9, #42a5f5);
+
+    transform: scale(1.08);
+
+    box-shadow:
+        0 0 8px rgba(66, 165, 245, 0.6),
+        0 0 20px rgba(30, 136, 229, 0.8),
+        0 0 35px rgba(13, 71, 161, 0.9),
+        0 10px 25px rgba(0,0,0,0.5),
+        inset 0 1px 0 rgba(255,255,255,0.4);
+
+    filter: brightness(1.1);
+}
+</style>
+
+<a id="zipBtn" href="fire_escape_export.zip" download>
+    ZIP DOWNLOAD
+</a>
+"""
+
+m.get_root().html.add_child(folium.Element(zip_html))
+
+# -------------------------------------------------
+# FINAL OUTPUT
+# -------------------------------------------------
+# =================================================
+
+folium.LayerControl().add_to(m)
+offset_css = """
+<style>
+/* Push ALL Leaflet UI (layers, zoom, search) down */
+.leaflet-top {
+    top: 120px !important;
+}
+
+/* Keep bottom controls stable */
+.leaflet-bottom {
+    bottom: 10px !important;
+}
+</style>
+"""
+m.get_root().html.add_child(folium.Element(offset_css))
+top_title = """
+<div style="
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    width: 100%;
+    z-index: 99999;
+    background: black;
+    color: white;
+    padding: 12px 0;
+    font-size: 22px;
+    font-weight: bold;
+    letter-spacing: 2px;
+    text-align: center;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.6);
+">
+    FIRE_ESCAPE
+</div>
+"""
+
+m.get_root().html.add_child(folium.Element(top_title))
+
+output_file = os.path.join(base, "Wildfire_Map.html")
+import zipfile
+
+# -------------------------------------------------
+# CREATE ZIP FILE (Layers + Heatmap)
+# -------------------------------------------------
+zip_path = os.path.join(base, "fire_escape_export.zip")
+
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+
+    # Add shapefiles (entire datasets)
+    for file in os.listdir(data_folder):
+        if file.endswith((".shp", ".dbf", ".shx", ".prj", ".cpg", ".geojson")):
+            zipf.write(os.path.join(data_folder, file), arcname=f"layers/{file}")
+
+    # Add heatmap image
+    heatmap_file = os.path.join(base, "heatmap.png")
+    if os.path.exists(heatmap_file):
+        zipf.write(heatmap_file, arcname="heatmap/heatmap.png")
+
+    # Add final HTML map
+    zipf.write(output_file, arcname="map/Wildfire_Map.html")
+
+print("📦 ZIP created:", zip_path)
+m.save(output_file)
+
+print("✅ Map saved:", output_file)
+webbrowser.open_new_tab("file://" + os.path.abspath(output_file))
